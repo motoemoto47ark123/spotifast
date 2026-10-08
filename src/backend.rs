@@ -1760,7 +1760,13 @@ impl Worker {
                         && self.authorizing_source == Some(source)
                         && self.authorization_attempt == attempt
                     {
-                        self.on_web_signed_in(source, *token);
+                        // The browser is done; say so instead of leaving the
+                        // sign-in screen waiting on it while the account is
+                        // checked.
+                        if source == ApiSource::Shared && !self.signed_in {
+                            self.emit(Event::Auth(AuthStatus::Connecting));
+                        }
+                        self.on_web_signed_in(source, *token, true);
                     } else if self.authorization_attempt == attempt {
                         self.finish_authorization(source);
                     }
@@ -2109,7 +2115,7 @@ impl Worker {
                         if !self.signed_in {
                             self.emit(Event::Auth(AuthStatus::Connecting));
                         }
-                        self.on_web_signed_in(source, token);
+                        self.on_web_signed_in(source, token, false);
                     } else {
                         // Signing in renews only the shared app's grant, so a
                         // personal app has to be authorized again where it was
@@ -2155,7 +2161,16 @@ impl Worker {
         })
     }
 
-    fn on_web_signed_in(&mut self, source: ApiSource, token: crate::auth::StoredToken) {
+    /// `interactive` is a grant the browser just returned. A restored grant
+    /// keeps retrying an unreachable Spotify, as at a cold start offline; a
+    /// fresh sign-in gives up after a few tries so its screen can say why
+    /// instead of spinning forever.
+    fn on_web_signed_in(
+        &mut self,
+        source: ApiSource,
+        token: crate::auth::StoredToken,
+        interactive: bool,
+    ) {
         let lease = self.credentials.lease(web_slot(source));
         let tokens = WebTokens::new(
             self.http.clone(),
@@ -2173,6 +2188,7 @@ impl Worker {
         let attempt = self.authorization_attempt;
         tokio::spawn(async move {
             let mut wait = Duration::from_secs(2);
+            let mut retries = 0;
             let error = loop {
                 if !lease.current() {
                     let _ = commands.send(Command::SignInEnded { source, attempt });
@@ -2189,9 +2205,11 @@ impl Worker {
                         });
                         return;
                     }
-                    Err(error @ ApiError::SignInExpired { .. }) => break error,
-                    Err(error) if error.status().is_some_and(|status| status < 500) => break error,
+                    Err(error) if !verification_retries(&error, interactive, retries) => {
+                        break error;
+                    }
                     Err(error) => {
+                        retries += 1;
                         log::warn!("Spotify sign-in verification will retry: {error}");
                         tokio::time::sleep(wait).await;
                         wait = (wait * 2).min(Duration::from_secs(60));
@@ -6011,6 +6029,60 @@ mod authorization_tests {
                 .any(|event| matches!(event, Event::Playback(LocalPlayback::Failed(_))))
         );
         assert!(playback_credentials(Some(AccountId::new("")), "dummy".into()).is_none());
+    }
+
+    #[test]
+    fn a_browser_sign_in_never_waits_forever_on_its_account_check() {
+        // An exhausted quota or an unreadable answer will not change by
+        // asking again, so neither a fresh nor a restored grant retries it.
+        for interactive in [true, false] {
+            for error in [
+                ApiError::QuotaExhausted,
+                ApiError::Decode("dummy".into()),
+                ApiError::SignInExpired {
+                    api_source: ApiSource::Shared,
+                },
+                ApiError::Status {
+                    status: 403,
+                    message: "dummy".into(),
+                },
+            ] {
+                assert!(!verification_retries(&error, interactive, 0), "{error:?}");
+            }
+        }
+        // A transient failure retries a few times for a fresh sign-in, then
+        // reports, while a restored grant keeps waiting for Spotify.
+        for error in [
+            ApiError::RateLimited,
+            ApiError::Network("dummy".into()),
+            ApiError::Status {
+                status: 503,
+                message: "dummy".into(),
+            },
+        ] {
+            assert!(verification_retries(&error, true, 0));
+            assert!(!verification_retries(
+                &error,
+                true,
+                INTERACTIVE_VERIFY_RETRIES
+            ));
+            assert!(verification_retries(&error, false, 1_000));
+        }
+    }
+}
+
+/// Retries a browser sign-in's account check gets before it reports failure.
+const INTERACTIVE_VERIFY_RETRIES: u32 = 3;
+
+/// Whether a failed account check is worth asking again. A rejected grant,
+/// a client error, an exhausted quota or an unreadable answer will not
+/// change by asking again; retrying those used to leave sign-in waiting
+/// forever with no word of why.
+fn verification_retries(error: &ApiError, interactive: bool, retries: u32) -> bool {
+    match error {
+        ApiError::SignInExpired { .. } | ApiError::QuotaExhausted | ApiError::Decode(_) => false,
+        error if error.status().is_some_and(|status| status < 500) => false,
+        _ => !interactive || retries < INTERACTIVE_VERIFY_RETRIES,
     }
 }
 
